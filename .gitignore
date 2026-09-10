@@ -1,3 +1,6 @@
+# Downloaded model checkpoints (fetched via scripts/download_model.py)
+models/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
