@@ -37,6 +37,7 @@ export CELLPOSE="docker run --rm --device nvidia.com/gpu=all -v $REPO:/workspace
 `~/.cellpose` mount caches downloaded/fine-tuned model weights across runs so they aren't
 re-fetched every time.
 
+
 # Usage
 
 ## Segmenting a single, moderately-sized image (`segment_image.py`)
