@@ -4,4 +4,4 @@ Edit REPO_ID below once you've created your Hugging Face account/namespace,
 or override it per-command with --repo-id.
 """
 
-REPO_ID = "<your-hf-username>/purkinje-cellpose-sam"
+REPO_ID = "sebgoti/purkinje_cellposesam"
