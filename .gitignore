@@ -81,6 +81,9 @@ target/
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# SLURM stuff
+slurm-*.out
+
 # IPython
 profile_default/
 ipython_config.py
@@ -219,3 +222,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Nextflow
+work/
+.nextflow/
+.nextflow.log*
+results/
+results_test/

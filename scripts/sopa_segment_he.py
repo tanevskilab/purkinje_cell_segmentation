@@ -40,6 +40,7 @@ from pathlib import Path
 import numpy as np
 import spatialdata
 import tifffile
+from shapely.geometry import box
 from skimage.draw import polygon as sk_polygon
 from spatialdata import SpatialData
 
@@ -292,52 +293,76 @@ def run_segmentation(
     log.info(f"Segmentation complete: {n_cells} cells detected.")
 
 
+MASK_TILE_SIZE = 1024  # tile size (pixels) of the output mask TIFF; must be a multiple of 16
+
+
 def polygons_to_mask_tiff(
     sdata: SpatialData,
     shapes_key: str,
     image_key: str,
     output_path: Path,
+    tile_size: int = MASK_TILE_SIZE,
 ) -> None:
     """
     Burn cell boundary polygons into a uint32 labelled instance mask and save
-    as a (possibly BigTIFF) TIFF file, using skimage.draw.polygon (exterior
-    ring only -- SOPA/Cellpose cell boundaries don't have interior holes).
+    as a tiled (possibly BigTIFF) TIFF file, using skimage.draw.polygon
+    (exterior ring only -- SOPA/Cellpose cell boundaries don't have interior
+    holes). Cell i (0-based row of the shapes table) gets label i + 1; where
+    polygons overlap, the later one wins.
 
-    Memory note: this allocates a single (H x W) uint32 array. For a
-    100 000 x 100 000 image that is ~40 GB.
+    Memory note: the mask is rasterised and written one tile_size x tile_size
+    tile at a time (polygons per tile looked up via the GeoDataFrame's spatial
+    index), so RAM stays proportional to one tile rather than the full
+    (H x W) uint32 array -- which would be ~39 GB for the largest VisiumHD slide.
     """
     image = sopa_utils.get_spatial_image(sdata, key=image_key)
     height = int(image.sizes["y"])
     width = int(image.sizes["x"])
 
     gdf = sdata.shapes[shapes_key]
-    log.info(f"Rasterising {len(gdf)} polygons onto {height}x{width} canvas")
+    log.info(f"Rasterising {len(gdf)} polygons onto {height}x{width} canvas "
+             f"in {tile_size}x{tile_size} tiles")
 
-    mask = np.zeros((height, width), dtype=np.uint32)
-    n_drawn = 0
-    for idx, geom in enumerate(gdf.geometry, start=1):
-        if geom is None or geom.is_empty:
-            continue
-        xs, ys = geom.exterior.coords.xy
-        rr, cc = sk_polygon(np.asarray(ys), np.asarray(xs), shape=(height, width))
-        mask[rr, cc] = idx
-        n_drawn += 1
+    geoms = gdf.geometry.values
+    sindex = gdf.sindex
+    stats = {"max_id": 0, "drawn": set()}
 
-    n_cells = int(mask.max())
-    log.info(f"Mask: {n_drawn} polygons drawn, {n_cells} labelled cells, max ID={n_cells}")
+    def tiles():
+        for y0 in range(0, height, tile_size):
+            for x0 in range(0, width, tile_size):
+                # tifffile expects full-size tiles; the padding past the image
+                # edge is cropped away when the TIFF is read
+                tile = np.zeros((tile_size, tile_size), dtype=np.uint32)
+                hits = sindex.query(box(x0, y0, x0 + tile_size, y0 + tile_size))
+                for pos in np.sort(hits):
+                    geom = geoms[pos]
+                    if geom is None or geom.is_empty:
+                        continue
+                    xs, ys = geom.exterior.coords.xy
+                    rr, cc = sk_polygon(np.asarray(ys) - y0, np.asarray(xs) - x0,
+                                        shape=tile.shape)
+                    if len(rr):
+                        tile[rr, cc] = pos + 1
+                        stats["drawn"].add(pos)
+                stats["max_id"] = max(stats["max_id"], int(tile.max()))
+                yield tile
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    is_big = mask.nbytes > 2 ** 32  # >4 GB -> BigTIFF required
+    is_big = height * width * 4 > 2 ** 32  # >4 GB uncompressed -> BigTIFF required
 
     log.info(f"Writing {'BigTIFF' if is_big else 'TIFF'}: {output_path}")
     tifffile.imwrite(
         output_path,
-        mask,
+        tiles(),
+        shape=(height, width),
+        dtype=np.uint32,
+        tile=(tile_size, tile_size),
         photometric="minisblack",
         bigtiff=is_big,
         compression="deflate",
         metadata={"axes": "YX"},
     )
+    log.info(f"Mask: {len(stats['drawn'])} polygons drawn, max ID={stats['max_id']}")
     log.info(f"Done. Mask size on disk: {output_path.stat().st_size / 1e9:.2f} GB")
 
 

@@ -32,6 +32,7 @@ import shutil
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import dask
 import dask.array as da
 import tifffile
 import zarr
@@ -43,6 +44,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger(__name__)
+
+CHUNK_SIZE = 4096  # target y/x chunk size for the zarr store, in pixels
 
 
 def load_lazy(path: str) -> tuple[SpatialData, str, list[str]]:
@@ -85,27 +88,19 @@ def load_lazy(path: str) -> tuple[SpatialData, str, list[str]]:
         dtype = series.dtype
         log.info(f"Series shape: {shape}, axes: {axes}, dtype: {dtype}")
 
-        # --- build a lazy dask array via ZarrStore (no pixel reads) ---
-        store = tif.aszarr(level=0)
+        # Uncompressed, contiguous TIFFs (e.g. the VisiumHD H&E scans, which are
+        # untiled strips of 1 row each) can be memory-mapped directly. Going
+        # through aszarr() instead would give one dask chunk per *row* (tens of
+        # thousands of tasks) and make the write extremely slow.
+        contiguous = series.dataoffset is not None
 
-    z = zarr.open(store, mode="r")
-
-    # zarr v2 keeps Group in zarr.hierarchy; zarr v3 exposes it at zarr.Group.
-    # Try both to stay compatible with whichever version is installed.
-    try:
-        group_type = zarr.hierarchy.Group
-    except AttributeError:
-        group_type = zarr.Group
-
-    # zarr root may be a group (multiscale) or array (single level)
-    if isinstance(z, group_type):
-        # multiscale: key "0" is always full resolution in OME-Zarr convention
-        first_key = sorted(z.keys())[0]
-        arr = da.from_zarr(z[first_key])
+    if contiguous:
+        log.info("TIFF data is contiguous/uncompressed: reading via memmap")
+        arr = da.from_array(tifffile.memmap(path, mode="r"), chunks=CHUNK_SIZE)
     else:
-        arr = da.from_zarr(z)
+        arr = _load_aszarr(path)
 
-    log.info(f"Dask array shape: {arr.shape}, chunks: {arr.chunks}")
+    log.info(f"Dask array shape: {arr.shape}, chunks: {arr.chunksize}")
 
     # --- normalise to (C, Y, X) ---
     axes = axes.upper()
@@ -124,6 +119,12 @@ def load_lazy(path: str) -> tuple[SpatialData, str, list[str]]:
         axes = "CYX"
     else:
         log.warning(f"Unexpected axes order '{axes}'; assuming first dim is C.")
+
+    # tifffile's aszarr() inherits the source TIFF's internal tile/strip size,
+    # which can produce a huge number of tiny zarr chunks. On a parallel
+    # filesystem the per-file overhead of that many chunks dominates write
+    # time, so rechunk to fewer, larger blocks (no-op for the memmap path).
+    arr = arr.rechunk({0: -1, 1: CHUNK_SIZE, 2: CHUNK_SIZE})
 
     n_channels, height, width = arr.shape
 
@@ -149,9 +150,33 @@ def load_lazy(path: str) -> tuple[SpatialData, str, list[str]]:
         dims=("c", "y", "x"),
         c_coords=channel_names,
         scale_factors=[2, 2, 2],
+        # Without this, parse() rechunks every pyramid level to 256x256 regardless of the
+        # dask chunking above -- ~150k chunk files for the largest slide's full-res level.
+        chunks={"c": -1, "y": CHUNK_SIZE, "x": CHUNK_SIZE},
     )
     sdata = SpatialData(images={image_key: image_model})
     return sdata, image_key, channel_names
+
+
+def _load_aszarr(path: str) -> da.Array:
+    """Lazy dask array of the full-resolution level via tifffile's ZarrStore."""
+    with tifffile.TiffFile(path) as tif:
+        store = tif.aszarr(level=0)
+    z = zarr.open(store, mode="r")
+
+    # zarr v2 keeps Group in zarr.hierarchy; zarr v3 exposes it at zarr.Group.
+    # Try both to stay compatible with whichever version is installed.
+    try:
+        group_type = zarr.hierarchy.Group
+    except AttributeError:
+        group_type = zarr.Group
+
+    # zarr root may be a group (multiscale) or array (single level)
+    if isinstance(z, group_type):
+        # multiscale: key "0" is always full resolution in OME-Zarr convention
+        first_key = sorted(z.keys())[0]
+        return da.from_zarr(z[first_key])
+    return da.from_zarr(z)
 
 
 def main() -> None:
@@ -164,7 +189,14 @@ def main() -> None:
     parser.add_argument("--output", required=True, help="Path for the output Zarr store (directory).")
     parser.add_argument("--overwrite", action="store_true", default=False,
         help="Remove --output first if it already exists, instead of failing.")
+    parser.add_argument("--n-workers", type=int, default=1,
+        help="Threads for dask's scheduler, driving chunk compression/write "
+             "and multiscale downsampling in parallel. Should match the "
+             "number of CPUs allocated to this task.")
     args = parser.parse_args()
+
+    dask.config.set(scheduler="threads", num_workers=args.n_workers)
+    log.info(f"Using dask threaded scheduler with {args.n_workers} workers.")
 
     output_path = Path(args.output)
     if output_path.exists():
